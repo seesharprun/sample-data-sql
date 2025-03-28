@@ -1,0 +1,144 @@
+name: Create release assets
+on:
+  push:
+    branches:
+      - 'main'
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  SCRIPT_OUTPUT_FILE: load.sql
+  BACKUP_OUTPUT_FILE: entities.bak
+jobs:
+  build-script:
+    name: Build SQL script
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Read and process CSV data
+        id: process-csv
+        run: |
+          # Set variables
+          CSV_FILE="data/vehicles.csv"
+          BASE_FILE="generate.sql"
+          TEMP_FILE="insert.sql"
+
+          # Replace the header with the SQL insert statement
+          sed -E "s/^[A-Za-z,]+$/INSERT INTO [Entities].[Vehicles] (ID, VehicleIdentificationNumber, Make, Model, Year, Mileage, FuelType) VALUES/" $CSV_FILE > $TEMP_FILE
+
+          # Replace the data rows with values in SQL format
+          sed -E -i "s/^([0-9]+),([^,]+),([^,]+),([^,]+),([0-9]+),([0-9]+),([^,\r\n]+)$/(\1, '\2', '\3', '\4', \5, \6, '\7'),/" $TEMP_FILE
+
+          # Replace the trailing comma from the last line with a semicolon
+          sed -i '$ s/,$/;\nGO/' $TEMP_FILE
+
+          # Combine the base SQL script and these SQL statements
+          cat $BASE_FILE $TEMP_FILE > $SCRIPT_OUTPUT_FILE
+
+          # Save the script file as an artifact
+          echo "SQL_SCRIPT=$SCRIPT_OUTPUT_FILE" >> $GITHUB_OUTPUT
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: script
+          path: ${{ steps.process-csv.outputs.SQL_SCRIPT }}
+  build-backup:
+    name: Generate backup
+    runs-on: ubuntu-latest
+    needs: 
+      - build-script
+    steps:
+      - name: Install sqlcmd
+        run: |
+          # Import the public repository GPG keys
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+
+          # Add the microsoft repository
+          sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/20.04/prod.list)"
+
+          # Install with apt
+          sudo apt-get update 
+          sudo apt-get install sqlcmd
+
+          # Check version
+          sqlcmd --version
+      - name: Create local SQL instance
+        run: |
+          # Create new instance of SQL using Docker
+          sqlcmd create mssql --accept-eula
+
+          # Check version
+          sqlcmd query "SELECT @@version"
+      - name: Download existing artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: script
+      - name: Create SQL backup
+        id: create-backup
+        run: |
+          # Create the database
+          sqlcmd query "CREATE DATABASE [Entities]"
+
+          # Load schema, tables, and data
+          sqlcmd -d Entities -i load.sql
+
+          # Validate that data was loaded
+          sqlcmd query -d Entities "SELECT COUNT(1) FROM Entities.Vehicles"
+
+          # Backup the database
+          sqlcmd query -d Entities "BACKUP DATABASE [Entities] TO DISK = '/var/opt/mssql/backup/$BACKUP_OUTPUT_FILE'"
+
+          # Download the backup file
+          docker cp $(docker container ls --filter "ancestor=mcr.microsoft.com/mssql/server:latest" --latest --quiet):/var/opt/mssql/backup/$BACKUP_OUTPUT_FILE ./$BACKUP_OUTPUT_FILE
+
+          # Save the backup file as an artifact
+          echo "SQL_BACKUP=$BACKUP_OUTPUT_FILE" >> $GITHUB_OUTPUT
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup
+          path: ${{ steps.create-backup.outputs.SQL_BACKUP }}
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: 
+      - build-script
+      - build-backup
+    steps:
+      - name: Create release
+        uses: actions/create-release@v1
+        id: create-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "v${{ github.run_number }}"
+          release_name: "Release ${{ github.run_number }}"
+          draft: false
+          prerelease: false
+      - name: Download existing artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: script
+      - name: Download existing artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backup
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create-release.outputs.upload_url }}
+          asset_path: ./${{ env.SCRIPT_OUTPUT_FILE }}
+          asset_name: ${{ env.SCRIPT_OUTPUT_FILE }}
+          asset_content_type: application/sql
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create-release.outputs.upload_url }}
+          asset_path: ./${{ env.BACKUP_OUTPUT_FILE }}
+          asset_name: ${{ env.BACKUP_OUTPUT_FILE }}
+          asset_content_type: application/octet-stream
